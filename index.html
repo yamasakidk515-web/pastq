@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>一次 過去問トレーナー</title>
+  <style>
+    body{font-family:-apple-system,system-ui,"Hiragino Sans","Noto Sans JP",sans-serif;margin:16px;line-height:1.5}
+    h1{font-size:18px;margin:0 0 12px}
+    .card{border:1px solid #ddd;border-radius:10px;padding:12px;margin:12px 0}
+    button{padding:10px 12px;border-radius:10px;border:1px solid #ccc;background:#fff}
+    button.primary{border-color:#333}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .muted{color:#666;font-size:12px}
+    label.choice{display:block;padding:10px;border:1px solid #ddd;border-radius:10px;margin:8px 0}
+    input[type="radio"]{margin-right:8px}
+    select,input[type="number"]{padding:8px;border-radius:10px;border:1px solid #ddd}
+    pre{white-space:pre-wrap;word-break:break-word;background:#f6f6f6;border:1px solid #ddd;border-radius:10px;padding:10px;font-size:12px}
+  </style>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.7.76/pdf.min.js"></script>
+  <script>
+    // iPhone(PWA)安定化：workerを使わない
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+      "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.7.76/pdf.worker.min.js";
+    pdfjsLib.disableWorker = true;
+  </script>
+</head>
+<body>
+  <h1>一次 過去問トレーナー（v1）</h1>
+  <div class="muted">R7のPDF（午前/午後/解答）を読み取って端末に保存します。</div>
+
+  <div class="card">
+    <h2 style="font-size:16px;margin:0 0 8px;">① R7 PDFを取り込む</h2>
+    <div class="row">
+      <div>
+        <div class="muted">午前問題PDF</div>
+        <input id="pdfA" type="file" accept="application/pdf" />
+      </div>
+      <div>
+        <div class="muted">午後問題PDF</div>
+        <input id="pdfB" type="file" accept="application/pdf" />
+      </div>
+      <div>
+        <div class="muted">解答PDF</div>
+        <input id="pdfK" type="file" accept="application/pdf" />
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:10px;">
+      <button class="primary" id="btnImport">📥 取り込み</button>
+      <button id="btnClear">🗑 初期化</button>
+      <span id="status" class="muted"></span>
+    </div>
+
+    <details style="margin-top:10px;">
+      <summary class="muted">🔧 デバッグ（失敗したらここを開く）</summary>
+      <pre id="dbg">ready</pre>
+    </details>
+  </div>
+
+  <div class="card">
+    <h2 style="font-size:16px;margin:0 0 8px;">② 出題（まずは確認用に1問表示）</h2>
+    <div class="row">
+      <button class="primary" id="btnOne">▶ 1問表示</button>
+      <span class="muted" id="count"></span>
+    </div>
+    <div id="qbox" style="margin-top:10px;"></div>
+  </div>
+
+<script>
+  const KEY_Q = "pastq_r7_questions_min_v1";
+  const statusEl = document.getElementById("status");
+  const dbgEl = document.getElementById("dbg");
+  const qbox = document.getElementById("qbox");
+  const countEl = document.getElementById("count");
+
+  const cidRe = /\(cid:\d+\)/g;
+  const noRe = /〔No．\s*(\d+)\s*〕/g;
+  const choiceRe = /^\s*([1-5])．\s*(.+)$/;
+
+  function setStatus(s){ statusEl.textContent = s; }
+  function dbg(x){ dbgEl.textContent = typeof x==="string" ? x : JSON.stringify(x,null,2); }
+  function clean(s){ return (s||"").replace(cidRe,"").replace(/\s+/g," ").trim(); }
+
+  function save(obj){ localStorage.setItem(KEY_Q, JSON.stringify(obj)); }
+  function load(){ try{ return JSON.parse(localStorage.getItem(KEY_Q)||"[]"); }catch{ return []; } }
+
+  async function pdfToText(file){
+    const buf = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: buf, disableWorker: true }).promise;
+    let out = "";
+    for(let p=1;p<=pdf.numPages;p++){
+      const page = await pdf.getPage(p);
+      const content = await page.getTextContent();
+      out += content.items.map(it=>it.str).join(" ") + "\n";
+    }
+    return out;
+  }
+
+  function parseAnswerKey(text){
+    const lines = text.split(/\n+/).map(s=>s.trim()).filter(Boolean);
+    const ans = {};
+    for(let i=0;i<lines.length-1;i++){
+      if(lines[i].startsWith("問題No.") && lines[i+1].startsWith("正答肢")){
+        const nos = (lines[i].match(/\d+/g)||[]).map(n=>parseInt(n,10));
+        const as = (lines[i+1].match(/\d+/g)||[]).map(n=>parseInt(n,10));
+        for(let k=0;k<Math.min(nos.length,as.length);k++) ans[nos[k]] = as[k];
+      }
+    }
+    return ans;
+  }
+
+  function splitByNo(text){
+    const parts = [];
+    let m,lastIndex=0,lastNo=null;
+    while((m=noRe.exec(text))!==null){
+      const no=parseInt(m[1],10);
+      if(lastNo!==null) parts.push({no:lastNo, body:text.slice(lastIndex,m.index)});
+      lastNo=no;
+      lastIndex=m.index+m[0].length;
+    }
+    if(lastNo!==null) parts.push({no:lastNo, body:text.slice(lastIndex)});
+    return parts;
+  }
+
+  function parseQuestions(text){
+    const blocks = splitByNo(text);
+    const qs=[];
+    for(const b of blocks){
+      const lines = b.body.split("\n").map(clean).filter(Boolean);
+      let start=-1;
+      for(let i=0;i<lines.length;i++){ if(choiceRe.test(lines[i])){ start=i; break; } }
+      if(start<0) continue;
+
+      const question = lines.slice(0,start).join(" ").trim();
+      const cLines = lines.slice(start);
+
+      const choices=["","","","",""];
+      let cur=null;
+      for(const ln of cLines){
+        const m = ln.match(choiceRe);
+        if(m){ cur=parseInt(m[1],10)-1; choices[cur]=(m[2]||"").trim(); }
+        else if(cur!==null && choices[cur]) choices[cur]=(choices[cur]+" "+ln).trim();
+      }
+      qs.push({no:b.no, question, choices});
+    }
+    return qs;
+  }
+
+  function refreshCount(){
+    const all = load();
+    countEl.textContent = `保存済み: ${all.length}問`;
+  }
+
+  document.getElementById("btnClear").addEventListener("click", ()=>{
+    localStorage.removeItem(KEY_Q);
+    setStatus("初期化しました");
+    dbg("cleared");
+    qbox.innerHTML="";
+    refreshCount();
+  });
+
+  document.getElementById("btnImport").addEventListener("click", async ()=>{
+    const fa=document.getElementById("pdfA").files[0];
+    const fb=document.getElementById("pdfB").files[0];
+    const fk=document.getElementById("pdfK").files[0];
+    if(!fa||!fb||!fk){ setStatus("PDF3つ選んでください"); return; }
+
+    setStatus("読み取り中…");
+    dbg({ua:navigator.userAgent, pdfjs:pdfjsLib.version, A:fa.name, B:fb.name, K:fk.name});
+
+    try{
+      const ta = await pdfToText(fa);
+      dbg({step:"A ok", sample:ta.slice(0,150)});
+
+      const tb = await pdfToText(fb);
+      dbg({step:"B ok", sample:tb.slice(0,150)});
+
+      const tk = await pdfToText(fk);
+      dbg({step:"K ok", sample:tk.slice(0,150)});
+
+      const ans = parseAnswerKey(tk);
+      const qa = parseQuestions(ta).map(x=>({id:`R7-A-${x.no}`, session:"A", no:x.no, question:x.question, choices:x.choices, answer:(ans[x.no]||"").toString()}));
+      const qb = parseQuestions(tb).map(x=>({id:`R7-B-${x.no}`, session:"B", no:x.no, question:x.question, choices:x.choices, answer:(ans[x.no]||"").toString()}));
+
+      const all = [...qa,...qb].filter(q=>q.question && q.choices.some(c=>c&&c.trim()));
+      save(all);
+      setStatus(`✅ 取り込み完了: ${all.length}問`);
+      dbg({done:true, count:all.length, first:all[0]||null});
+      refreshCount();
+    }catch(e){
+      setStatus("❌ 失敗: " + (e?.message||e));
+      dbg({error:(e?.message||e), stack:e?.stack||null});
+    }
+  });
+
+  document.getElementById("btnOne").addEventListener("click", ()=>{
+    const all = load();
+    if(!all.length){ alert("先に取り込みしてください"); return; }
+    const q = all[Math.floor(Math.random()*all.length)];
+    qbox.innerHTML =
+      `<div class="muted">${q.id} / No.${q.no} (${q.session==="A"?"午前":"午後"})</div>` +
+      `<div style="margin:6px 0 10px;">${q.question}</div>` +
+      q.choices.map((c,i)=>c?`<label class="choice">${i+1}. ${c}</label>`:"").join("") +
+      `<div class="muted">正答: ${q.answer}</div>`;
+  });
+
+  refreshCount();
+</script>
+</body>
+</html>
